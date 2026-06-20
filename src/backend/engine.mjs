@@ -1,29 +1,178 @@
 import * as RAPIER from '@dimforge/rapier3d-compat';
 import * as THREE from 'three';
 import fs from 'fs';
-import { resolve } from 'path';
+import { resolve, join } from 'path';
 import zlib from 'zlib';
 
 let rapierReady = false;
 
+// ── XGBoost Models ──
+let xgboostModels = [null, null, null, null];
+
+function loadXGBoostModels() {
+  const modelNames = [
+    'xgboost_model_winner_1.json',
+    'xgboost_model_winner_2.json',
+    'xgboost_model_winner_3.json',
+    'xgboost_model_winner_4.json',
+  ];
+  for (let i = 0; i < modelNames.length; i++) {
+    const modelPath = join(process.cwd(), modelNames[i]);
+    if (fs.existsSync(modelPath)) {
+      xgboostModels[i] = JSON.parse(fs.readFileSync(modelPath, 'utf-8'));
+      console.log(`[Engine] Loaded XGBoost model: ${modelNames[i]}`);
+    } else {
+      console.warn(`[Engine] XGBoost model not found: ${modelPath}`);
+    }
+  }
+}
+
+function evaluateXGBoost(features, model) {
+  if (!model || !model.learner) return [0, 0, 0, 0, 0, 0, 0, 0];
+  const booster = model.learner.gradient_booster.model;
+  const trees = booster.trees;
+  const treeInfo = booster.tree_info;
+  const numClasses = 8;
+  const logits = new Array(numClasses).fill(0);
+
+  for (let i = 0; i < trees.length; i++) {
+    const classId = treeInfo[i];
+    const tree = trees[i];
+    let nodeIdx = 0;
+    while (tree.left_children[nodeIdx] !== -1) {
+      const featIdx = tree.split_indices[nodeIdx];
+      const val = features[featIdx] ?? 0;
+      const cond = tree.split_conditions[nodeIdx];
+      if (val < cond) {
+        nodeIdx = tree.left_children[nodeIdx];
+      } else {
+        nodeIdx = tree.right_children[nodeIdx];
+      }
+    }
+    logits[classId] += tree.base_weights[nodeIdx];
+  }
+
+  let maxLogit = -Infinity;
+  for (let i = 0; i < numClasses; i++) if (logits[i] > maxLogit) maxLogit = logits[i];
+  const exps = logits.map(l => Math.exp(l - maxLogit));
+  const sumExp = exps.reduce((a, b) => a + b, 0);
+  return exps.map(e => e / sumExp);
+}
+
+function buildPredictorFeatures(snapshotHistory, stepCount) {
+  if (snapshotHistory.length < 1) return null;
+
+  const current = snapshotHistory[snapshotHistory.length - 1];
+  const prev = snapshotHistory.length > 1 ? snapshotHistory[snapshotHistory.length - 2] : current;
+  const features = [];
+
+  // 1. Raw positions/velocities (8 * 6 = 48)
+  for (let i = 0; i < 8; i++) {
+    const m = current[i] || { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
+    features.push(m.x, m.y, m.z, m.vx, m.vy, m.vz);
+  }
+
+  // 2. Engineered features (8 * 8 = 64)
+  for (let i = 0; i < 8; i++) {
+    const mNow = current[i] || { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
+    const mPrev = prev[i] || { vx: 0, vy: 0, vz: 0 };
+    features.push(mNow.vx - mPrev.vx, mNow.vy - mPrev.vy, mNow.vz - mPrev.vz);
+    const speedNow = Math.sqrt(mNow.vx * mNow.vx + mNow.vy * mNow.vy + mNow.vz * mNow.vz);
+    features.push(speedNow);
+    let speedSum5 = 0;
+    const count5 = Math.min(5, snapshotHistory.length);
+    for (let h = 0; h < count5; h++) {
+      const snap = snapshotHistory[snapshotHistory.length - 1 - h];
+      const m = snap[i] || { vx: 0, vy: 0, vz: 0 };
+      speedSum5 += Math.sqrt(m.vx * m.vx + m.vy * m.vy + m.vz * m.vz);
+    }
+    features.push(speedSum5 / count5);
+    let xSum10 = 0, ySum10 = 0, zSum10 = 0;
+    const count10 = Math.min(10, snapshotHistory.length);
+    for (let h = 0; h < count10; h++) {
+      const snap = snapshotHistory[snapshotHistory.length - 1 - h];
+      const m = snap[i] || { x: 0, y: 0, z: 0 };
+      xSum10 += m.x;
+      ySum10 += m.y;
+      zSum10 += m.z;
+    }
+    features.push(xSum10 / count10, ySum10 / count10, zSum10 / count10);
+  }
+
+  // 3. Pairwise Distances (28)
+  for (let i = 0; i < 8; i++) {
+    for (let j = i + 1; j < 8; j++) {
+      const mi = current[i] || { x: 0, y: 0, z: 0 };
+      const mj = current[j] || { x: 0, y: 0, z: 0 };
+      features.push(Math.sqrt((mi.x - mj.x) ** 2 + (mi.y - mj.y) ** 2 + (mi.z - mj.z) ** 2));
+    }
+  }
+
+  // 4. Ranks (8)
+  const zPos = [0, 1, 2, 3, 4, 5, 6, 7].map(i => ({ i, z: current[i] ? current[i].z : -1000 }));
+  zPos.sort((a, b) => b.z - a.z);
+  const ranks = new Array(8);
+  zPos.forEach((item, index) => { ranks[item.i] = index + 1; });
+  features.push(...ranks);
+
+  // 5. Race Progress (1)
+  features.push(Math.min(1.0, (stepCount * (1 / 120)) / 45.0));
+
+  return features;
+}
+
+function runPredictions(features) {
+  if (xgboostModels.some(m => m === null)) return null;
+  if (!features) return null;
+
+  const results = [];
+  let currentFeatures = [...features];
+
+  for (let mIdx = 0; mIdx < 4; mIdx++) {
+    const probs = evaluateXGBoost(currentFeatures, xgboostModels[mIdx]);
+    const maxProb = Math.max(...probs);
+    const winnerId = probs.indexOf(maxProb);
+    results.push({
+      probabilities: probs,
+      confidence: maxProb,
+      winner_id: winnerId,
+    });
+    if (mIdx < 3) currentFeatures.push(winnerId);
+  }
+
+  return results;
+}
+
 // ── In-memory store ──
 let storedSnapshot = null;
 let storedMetadata = null;
+
+// Pre-restored world — avoids ~25s restoreSnapshot on every race request
+let warmedWorld = null;
+let warmupPromise = null;
 
 export async function storeSnapshot(snapshotBuffer, metadata) {
   // If the incoming buffer is gzipped, decompress it for the in-memory store
   if (snapshotBuffer[0] === 0x1f && snapshotBuffer[1] === 0x8b) {
     storedSnapshot = zlib.gunzipSync(snapshotBuffer);
     console.log(`[Engine] Decompressed received snapshot from ${snapshotBuffer.length} to ${storedSnapshot.length} bytes`);
-    fs.writeFileSync(resolve('..', 'track-snapshot.bin.gz'), snapshotBuffer);
+    fs.writeFileSync(resolve('track-snapshot.bin.gz'), snapshotBuffer);
   } else {
     storedSnapshot = snapshotBuffer;
-    fs.writeFileSync(resolve('..', 'track-snapshot.bin'), snapshotBuffer);
+    fs.writeFileSync(resolve('track-snapshot.bin'), snapshotBuffer);
   }
   
   storedMetadata = metadata;
-  fs.writeFileSync(resolve('..', 'track-metadata.json'), JSON.stringify(metadata));
+  fs.writeFileSync(resolve('track-metadata.json'), JSON.stringify(metadata));
   console.log(`[Engine] Snapshot stored in memory: ${storedSnapshot.length} bytes, ${metadata.marbles?.length || 0} marbles`);
+
+  // Invalidate warm world — new snapshot needs a fresh restore
+  if (warmedWorld) {
+    warmedWorld.free();
+    warmedWorld = null;
+  }
+  warmupPromise = null;
+  scheduleRewarm();
 }
 
 export async function ensureInitialized() {
@@ -32,14 +181,19 @@ export async function ensureInitialized() {
     rapierReady = true;
     console.log('[Engine] Rapier initialized');
   }
+  if (xgboostModels.every(m => m === null)) {
+    loadXGBoostModels();
+  }
 }
 
 // ── Autonomous Loading ──
 export async function autoInitialize() {
+  if (storedSnapshot && storedMetadata) return;
+
   await ensureInitialized();
-  const snapshotPath = resolve('..', 'track-snapshot.bin');
-  const snapshotGzPath = resolve('..', 'track-snapshot.bin.gz');
-  const metaPath = resolve('..', 'track-metadata.json');
+  const snapshotPath = resolve('track-snapshot.bin');
+  const snapshotGzPath = resolve('track-snapshot.bin.gz');
+  const metaPath = resolve('track-metadata.json');
   
   if (fs.existsSync(snapshotGzPath) && fs.existsSync(metaPath)) {
     const rawBuffer = fs.readFileSync(snapshotGzPath);
@@ -55,6 +209,52 @@ export async function autoInitialize() {
   }
 }
 
+// ── Constants (matched to frontend) ──
+const OBSTACLE_SINK_DEPTH = 14;
+const OBSTACLE_SINK_TIME = 1.20;
+const OBSTACLE_HOLD_TIME = 0.28;
+const PHYSICS_STEP = 1 / 120;
+const MARBLE_SETTLE_FRAMES = 90;
+
+function applyWorldDefaults(world) {
+  world.gravity = { x: 0, y: -9.81 * 15.2, z: 0 };
+  world.timestep = PHYSICS_STEP;
+}
+
+/** Load track data and restore the physics world ahead of the first race request. */
+export async function startWarmup() {
+  if (warmedWorld) return warmedWorld;
+  if (warmupPromise) return warmupPromise;
+
+  warmupPromise = (async () => {
+    await autoInitialize();
+    const t = Date.now();
+    console.log(`[Engine] Pre-warming physics world from ${storedSnapshot.length} byte snapshot...`);
+    const world = RAPIER.World.restoreSnapshot(storedSnapshot);
+    applyWorldDefaults(world);
+    warmedWorld = world;
+    console.log(`[Engine] Pre-warm complete in ${Date.now() - t}ms`);
+    warmupPromise = null;
+    return warmedWorld;
+  })();
+
+  return warmupPromise;
+}
+
+export function getWarmupStatus() {
+  return {
+    ready: warmedWorld !== null,
+    warming: warmupPromise !== null,
+    hasSnapshot: !!(storedSnapshot && storedMetadata),
+  };
+}
+
+function scheduleRewarm() {
+  startWarmup().catch((err) => {
+    console.error('[Engine] Background re-warm failed:', err.message);
+  });
+}
+
 // ── Seeded PRNG (exact replica of frontend) ──
 function mulberry32(a) {
   return function () {
@@ -65,13 +265,6 @@ function mulberry32(a) {
   };
 }
 
-// ── Constants (matched to frontend) ──
-const OBSTACLE_SINK_DEPTH = 14;
-const OBSTACLE_SINK_TIME = 1.20;
-const OBSTACLE_HOLD_TIME = 0.28;
-const PHYSICS_STEP = 1 / 120;
-const MARBLE_SETTLE_FRAMES = 90;
-
 const _bladeAxis = new THREE.Vector3(1, 0, 0);
 const _bladeRotOffset = new THREE.Quaternion();
 const _tempQ = new THREE.Quaternion();
@@ -80,17 +273,8 @@ const _tempVec = new THREE.Vector3();
 export async function* streamRace(seed) {
   const _startTime = Date.now();
   console.log(`[Engine] streamRace initiated at +0ms`);
-  
-  if (!rapierReady) {
-    console.log(`[Engine] autoInitialize (Rapier) starting...`);
-    await autoInitialize();
-    console.log(`[Engine] autoInitialize (Rapier) done at +${Date.now() - _startTime}ms`);
-  }
-  if (!storedSnapshot || !storedMetadata) {
-    console.log(`[Engine] autoInitialize (missing data) starting...`);
-    await autoInitialize();
-    console.log(`[Engine] autoInitialize (missing data) done at +${Date.now() - _startTime}ms`);
-  }
+
+  await startWarmup();
 
   const meta = storedMetadata;
   const seedNum = typeof seed === 'number' ? seed : (typeof seed === 'string' ? parseInt(seed, 10) : seed);
@@ -100,13 +284,18 @@ export async function* streamRace(seed) {
 
   for (let i = 0; i < 7; i++) marbleRandom();
 
-  console.log(`[Engine] Restoring Rapier snapshot at +${Date.now() - _startTime}ms...`);
-  const _restoreStart = Date.now();
-  const physicsWorld = RAPIER.World.restoreSnapshot(storedSnapshot);
-  console.log(`[Engine] Restored Rapier snapshot in ${Date.now() - _restoreStart}ms`);
-  
-  physicsWorld.gravity = { x: 0, y: -9.81 * 15.2, z: 0 };
-  physicsWorld.timestep = PHYSICS_STEP;
+  let physicsWorld;
+  if (warmedWorld) {
+    physicsWorld = warmedWorld;
+    warmedWorld = null;
+    console.log(`[Engine] Using pre-warmed world at +${Date.now() - _startTime}ms`);
+  } else {
+    console.log(`[Engine] Restoring Rapier snapshot at +${Date.now() - _startTime}ms...`);
+    const _restoreStart = Date.now();
+    physicsWorld = RAPIER.World.restoreSnapshot(storedSnapshot);
+    applyWorldDefaults(physicsWorld);
+    console.log(`[Engine] Restored Rapier snapshot in ${Date.now() - _restoreStart}ms`);
+  }
 
   function getBody(handle) { return handle !== -1 ? physicsWorld.getRigidBody(handle) : null; }
 
@@ -126,6 +315,9 @@ export async function* streamRace(seed) {
   obstacleBodies.forEach(b => setRestitution(b, 0.1));
   bladeBodies.forEach(b => setRestitution(b, 0.12));
   setRestitution(gateBody, 0.05);
+
+  // Lower linear damping so marbles keep enough momentum to climb inclines
+  marbleBodies.forEach(b => { if (b) b.setLinearDamping(0.01); });
 
   const obsState = meta.obstacles.map(() => ({
     timer: obstacleRandom() * 1.0 + 1.0,
@@ -147,6 +339,10 @@ export async function* streamRace(seed) {
   const fallTimer = meta.marbles.map(() => 0);
   const stuckTimer = meta.marbles.map(() => 0);
   const kickCooldown = meta.marbles.map(() => 0);
+
+  // ── Prediction state ──
+  const predictionHistory = [];
+  let lastPredictions = null;
 
   console.log(`[Engine] Setup complete. Yielding 'start' chunk at +${Date.now() - _startTime}ms`);
   yield { type: 'start', seed: seedNum, physicsStep: PHYSICS_STEP };
@@ -364,12 +560,34 @@ export async function* streamRace(seed) {
       blades: meta.blades.map((b, i) => { const body = bladeBodies[i]; if (!body) return [0, 0, 0, 1]; const r = body.rotation(); return [r.x, r.y, r.z, r.w]; }),
       gateIsOpen: gateIsOpen
     };
+
+    // Attach last computed predictions to frame (computed below during yield idle)
+    if (lastPredictions) {
+      frame.predictions = lastPredictions;
+    }
     
     yield { type: 'frame', frame };
     
-    // Stream at 1.5x real-time speed (180 physics ticks per real second)
-    // Send a batch every 6 ticks (33ms) -> 30 batches/sec * 6 = 180 ticks/sec
-    if (physicsTick % 6 === 0) await new Promise(r => setTimeout(r, 33));
+    // Stream at 3.0x real-time speed — during this idle window, compute predictions
+    // so they don't block the tight physics loop
+    if (physicsTick % 12 === 0) {
+      // Capture snapshot and run predictions during yield idle (non-blocking)
+      if (gateIsOpen && physicsTick % 60 === 0) {
+        const snapFrame = meta.marbles.map((m, i) => {
+          const body = marbleBodies[i];
+          if (!body || eliminated[i] || finished[i]) return { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 };
+          const p = body.translation();
+          const v = body.linvel();
+          return { x: p.x, y: p.y, z: p.z, vx: v.x, vy: v.y, vz: v.z };
+        });
+        predictionHistory.push(snapFrame);
+        if (predictionHistory.length > 15) predictionHistory.shift();
+
+        const features = buildPredictorFeatures(predictionHistory, physicsTick);
+        lastPredictions = runPredictions(features);
+      }
+      await new Promise(r => setTimeout(r, 33));
+    }
     
     let activeCount = 0;
     for (let i = 0; i < marbleBodies.length; i++) {
@@ -379,5 +597,6 @@ export async function* streamRace(seed) {
   }
 
   physicsWorld.free();
+  scheduleRewarm();
   yield { type: 'end' };
 }

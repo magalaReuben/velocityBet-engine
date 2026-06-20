@@ -6,9 +6,10 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
   app.enableCors({
-    origin: '*',
+    origin: ['http://localhost:5173', 'http://127.0.0.1:5173', 'https://velocitybet-frontend-1037423115479.us-central1.run.app'],
+    credentials: true,
     methods: 'OPTIONS, POST, GET',
-    allowedHeaders: 'Content-Type',
+    allowedHeaders: 'Content-Type, Authorization',
   });
 
   // Enable raw body parsing specifically for the snapshot endpoint
